@@ -128,7 +128,7 @@ fn linux_reflink(src: &PathAndMetadata, dest: &PathAndMetadata, log: &dyn Log) -
 /// Reflink `target` to `link` and expect these two files to be equally sized.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn reflink_overwrite(target: &std::path::Path, link: &std::path::Path) -> io::Result<()> {
-    use nix::request_code_read_write;
+    use nix::request_code_readwrite;
     use std::os::unix::prelude::AsRawFd;
     use std::mem::{size_of, zeroed};
 
@@ -202,7 +202,7 @@ fn reflink_overwrite(target: &std::path::Path, link: &std::path::Path) -> io::Re
         let ret = unsafe {
             libc::ioctl(
                 src.as_raw_fd(),
-                request_code_read_write!(FIDEDUPERANGE_TYPE, FIDEDUPERANGE_NR, FIDEDUPERANGE_SIZE) as libc::c_ulong,
+                request_code_readwrite!(FIDEDUPERANGE_TYPE, FIDEDUPERANGE_NR, FIDEDUPERANGE_SIZE) as libc::c_ulong,
                 &mut dedupe_range,
             )
         };
