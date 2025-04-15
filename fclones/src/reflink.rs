@@ -676,7 +676,7 @@ pub mod test {
         let _sequential = cfg::CrossTest::new(true);
         test_reflink_command_fills_file_with_content();
     }
-    
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_reflink_with_fideduperange_fallback() {
@@ -691,21 +691,21 @@ pub mod test {
             let file_path_1 = root.join("source_file");
             let file_path_2 = root.join("dest_file");
             let test_content = "test content for dedupe";
-    
+
             // Create test files
             write_file(&file_path_1, test_content);
             write_file(&file_path_2, "original content");
-    
+
             // Create PathAndMetadata objects
             let file_1 = PathAndMetadata::new(FcPath::from(&file_path_1)).unwrap();
             let file_2 = PathAndMetadata::new(FcPath::from(&file_path_2)).unwrap();
-    
+
             // Directly call linux_reflink which will try FIDEDUPERANGE first
             linux_reflink(&file_1, &file_2, &log).unwrap();
-    
+
             // Verify that the destination now has the source content
             assert_eq!(read_file(&file_path_2), test_content);
-    
+
             // Verify files still exist
             assert!(file_path_1.exists());
             assert!(file_path_2.exists());
