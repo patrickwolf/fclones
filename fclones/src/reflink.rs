@@ -110,13 +110,17 @@ fn linux_reflink(src: &PathAndMetadata, dest: &PathAndMetadata, log: &dyn Log) -
     let result = reflink_overwrite_dedupe(&fs_target, &std_link);
     let result = match result {
         // Check for both EOPNOTSUPP (95) and ENOTTY (25) as possible "ioctl not supported" errors
-        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) || e.raw_os_error() == Some(libc::ENOTTY) => {
+        Err(e)
+            if e.raw_os_error() == Some(libc::EOPNOTSUPP)
+                || e.raw_os_error() == Some(libc::ENOTTY) =>
+        {
             // Fall back to FICLONE
             reflink_overwrite(&fs_target, &std_link)
         }
         other => other,
     };
 
+    // Use the same error handling pattern as the original code
     match result {
         Err(e) => {
             if let Err(remove_err) = FsCommand::unsafe_rename(&tmp, &dest.path) {
