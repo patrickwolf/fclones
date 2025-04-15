@@ -699,13 +699,13 @@ pub mod test {
             // Create PathAndMetadata objects
             let file_1 = PathAndMetadata::new(FcPath::from(&file_path_1)).unwrap();
             let file_2 = PathAndMetadata::new(FcPath::from(&file_path_2)).unwrap();
-            
+    
             // Directly call linux_reflink which will try FIDEDUPERANGE first
             linux_reflink(&file_1, &file_2, &log).unwrap();
     
             // Verify that the destination now has the source content
             assert_eq!(read_file(&file_path_2), test_content);
-            
+    
             // Verify files still exist
             assert!(file_path_1.exists());
             assert!(file_path_2.exists());
@@ -737,25 +737,25 @@ pub mod test {
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mut perms = fs::metadata(&file_path_2).unwrap().permissions();
-                perms.set_mode(0o644);  // Ensure standard permissions
+                perms.set_mode(0o644); // Ensure standard permissions
                 fs::set_permissions(&file_path_2, perms).unwrap();
             }
     
             // Create PathAndMetadata objects
             let file_1 = PathAndMetadata::new(FcPath::from(&file_path_1)).unwrap();
             let file_2 = PathAndMetadata::new(FcPath::from(&file_path_2)).unwrap();
-            
+    
             // Directly call linux_reflink which will try FIDEDUPERANGE first
             linux_reflink(&file_1, &file_2, &log).unwrap();
     
             // Verify content is still correct
             assert_eq!(read_file(&file_path_2), test_content);
-            
+    
             // Verify files still exist
             assert!(file_path_1.exists());
             assert!(file_path_2.exists());
         })
-    }    
+    }
     
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -770,17 +770,18 @@ pub mod test {
             let log = StdLog::new();
             let file_path_1 = root.join("large_source_file");
             let file_path_2 = root.join("large_dest_file");
-            
+    
             // Create a 20MB file (exceeds the 16MB limit that some older kernels had for FIDEDUPERANGE)
             // Use a repeating pattern to save memory during test
             let chunk = "0123456789ABCDEF".repeat(4096); // 64KB chunk
             let mut large_content = String::new();
-            for i in 0..320 { // 320 * 64KB = 20MB
+            for i in 0..320 {
+                // 320 * 64KB = 20MB
                 large_content.push_str(&format!("CHUNK{:04}:", i));
                 large_content.push_str(&chunk);
                 large_content.push('\n');
             }
-            
+    
             // Write the large file and a different destination file
             write_file(&file_path_1, &large_content);
             write_file(&file_path_2, "original small content");
@@ -788,7 +789,7 @@ pub mod test {
             // Create PathAndMetadata objects
             let file_1 = PathAndMetadata::new(FcPath::from(&file_path_1)).unwrap();
             let file_2 = PathAndMetadata::new(FcPath::from(&file_path_2)).unwrap();
-            
+    
             // Directly call linux_reflink which will try FIDEDUPERANGE first
             linux_reflink(&file_1, &file_2, &log).unwrap();
     
@@ -796,15 +797,15 @@ pub mod test {
             let dest_metadata = fs::metadata(&file_path_2).unwrap();
             let src_metadata = fs::metadata(&file_path_1).unwrap();
             assert_eq!(dest_metadata.len(), src_metadata.len());
-            
+    
             // Verify the beginning and end of the file (avoiding loading the entire file)
             let dest_content = read_file(&file_path_2);
             assert!(dest_content.starts_with("CHUNK0000:"));
             assert!(dest_content.ends_with("\n"));
-            
+    
             // Verify files still exist
             assert!(file_path_1.exists());
             assert!(file_path_2.exists());
         })
-    }    
+    }
 }
