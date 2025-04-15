@@ -676,16 +676,16 @@ pub mod test {
         let _sequential = cfg::CrossTest::new(true);
         test_reflink_command_fills_file_with_content();
     }
-
+    
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_reflink_with_fideduperange_fallback() {
         let _sequential = cfg::CrossTest::new(false);
-    
+
         if !cached_reflink_supported() {
             return;
         }
-    
+
         with_dir("dedupe/reflink_dedupe_fallback", |root| {
             let log = StdLog::new();
             let file_path_1 = root.join("source_file");
@@ -711,26 +711,26 @@ pub mod test {
             assert!(file_path_2.exists());
         })
     }
-    
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_reflink_with_fideduperange_identical_content() {
         let _sequential = cfg::CrossTest::new(false);
-    
+
         if !cached_reflink_supported() {
             return;
         }
-    
+
         with_dir("dedupe/reflink_dedupe_identical", |root| {
             let log = StdLog::new();
             let file_path_1 = root.join("source_file");
             let file_path_2 = root.join("dest_file");
             let test_content = "identical content in both files";
-    
+
             // Create identical test files
             write_file(&file_path_1, test_content);
             write_file(&file_path_2, test_content);
-    
+
             // Slightly modify the file metadata to ensure they aren't already the same inode
             // This ensures a real deduplication happens rather than a no-op
             #[cfg(unix)]
@@ -740,37 +740,37 @@ pub mod test {
                 perms.set_mode(0o644); // Ensure standard permissions
                 fs::set_permissions(&file_path_2, perms).unwrap();
             }
-    
+
             // Create PathAndMetadata objects
             let file_1 = PathAndMetadata::new(FcPath::from(&file_path_1)).unwrap();
             let file_2 = PathAndMetadata::new(FcPath::from(&file_path_2)).unwrap();
-    
+
             // Directly call linux_reflink which will try FIDEDUPERANGE first
             linux_reflink(&file_1, &file_2, &log).unwrap();
-    
+
             // Verify content is still correct
             assert_eq!(read_file(&file_path_2), test_content);
-    
+
             // Verify files still exist
             assert!(file_path_1.exists());
             assert!(file_path_2.exists());
         })
     }
-    
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_reflink_with_fideduperange_large_file() {
         let _sequential = cfg::CrossTest::new(false);
-    
+
         if !cached_reflink_supported() {
             return;
         }
-    
+
         with_dir("dedupe/reflink_dedupe_large_file", |root| {
             let log = StdLog::new();
             let file_path_1 = root.join("large_source_file");
             let file_path_2 = root.join("large_dest_file");
-    
+
             // Create a 20MB file (exceeds the 16MB limit that some older kernels had for FIDEDUPERANGE)
             // Use a repeating pattern to save memory during test
             let chunk = "0123456789ABCDEF".repeat(4096); // 64KB chunk
@@ -781,28 +781,28 @@ pub mod test {
                 large_content.push_str(&chunk);
                 large_content.push('\n');
             }
-    
+
             // Write the large file and a different destination file
             write_file(&file_path_1, &large_content);
             write_file(&file_path_2, "original small content");
-    
+
             // Create PathAndMetadata objects
             let file_1 = PathAndMetadata::new(FcPath::from(&file_path_1)).unwrap();
             let file_2 = PathAndMetadata::new(FcPath::from(&file_path_2)).unwrap();
-    
+
             // Directly call linux_reflink which will try FIDEDUPERANGE first
             linux_reflink(&file_1, &file_2, &log).unwrap();
-    
+
             // Verify the file size is correct (this avoids loading the entire file into memory)
             let dest_metadata = fs::metadata(&file_path_2).unwrap();
             let src_metadata = fs::metadata(&file_path_1).unwrap();
             assert_eq!(dest_metadata.len(), src_metadata.len());
-    
+
             // Verify the beginning and end of the file (avoiding loading the entire file)
             let dest_content = read_file(&file_path_2);
             assert!(dest_content.starts_with("CHUNK0000:"));
             assert!(dest_content.ends_with("\n"));
-    
+
             // Verify files still exist
             assert!(file_path_1.exists());
             assert!(file_path_2.exists());
