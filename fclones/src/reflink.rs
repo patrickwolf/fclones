@@ -149,7 +149,7 @@ fn reflink_overwrite(target: &std::path::Path, link: &std::path::Path) -> io::Re
     const FIDEDUPERANGE_NR: u8 = 54;
 
     // Status codes from Linux kernel
-    const FILE_DEDUPE_RANGE_SAME: i32 = 0;
+    // FILE_DEDUPE_RANGE_SAME: i32 = 0: Blocks are identical and were successfully deduplicated
     const FILE_DEDUPE_RANGE_DIFFERS: i32 = 1;
 
     // Define dedupe range structures
