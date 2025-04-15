@@ -106,7 +106,18 @@ fn linux_reflink(src: &PathAndMetadata, dest: &PathAndMetadata, log: &dyn Log) -
         return Err(e);
     }
 
-    match reflink_overwrite(&fs_target, &std_link) {
+    // Try FIDEDUPERANGE first, fall back to FICLONE if not supported
+    let result = reflink_overwrite_dedupe(&fs_target, &std_link);
+    let result = match result {
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+            // Fall back to FICLONE
+            reflink_overwrite(&fs_target, &std_link)
+        }
+        other => other,
+    };
+
+    // Use the same error handling pattern as the original code
+    match result {
         Err(e) => {
             if let Err(remove_err) = FsCommand::unsafe_rename(&tmp, &dest.path) {
                 log.warn(format!(
@@ -128,6 +139,51 @@ fn linux_reflink(src: &PathAndMetadata, dest: &PathAndMetadata, log: &dyn Log) -
 /// Reflink `target` to `link` and expect these two files to be equally sized.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn reflink_overwrite(target: &std::path::Path, link: &std::path::Path) -> io::Result<()> {
+    use nix::request_code_write;
+    use std::os::unix::prelude::AsRawFd;
+
+    let src = fs::File::open(target)?;
+
+    // This operation does not require `.truncate(true)` because the files are already of the same size.
+    let dest = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(link)?;
+
+    // From /usr/include/linux/fs.h:
+    // #define FICLONE		_IOW(0x94, 9, int)
+    const FICLONE_TYPE: u8 = 0x94;
+    const FICLONE_NR: u8 = 9;
+    const FICLONE_SIZE: usize = std::mem::size_of::<libc::c_int>();
+
+    let ret = unsafe {
+        libc::ioctl(
+            dest.as_raw_fd(),
+            request_code_write!(FICLONE_TYPE, FICLONE_NR, FICLONE_SIZE),
+            src.as_raw_fd(),
+        )
+    };
+
+    #[allow(clippy::if_same_then_else)]
+    if ret == -1 {
+        let err = io::Error::last_os_error();
+        let code = err.raw_os_error().unwrap(); // unwrap () Ok, created from `last_os_error()`
+        if code == libc::EOPNOTSUPP { // 95
+             // Filesystem does not supported reflinks.
+             // No cleanup required, file is left untouched.
+        } else if code == libc::EINVAL { // 22
+             // Source filesize was larger than destination.
+        }
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+/// Reflink `target` to `link` and expect these two files to be equally sized.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn reflink_overwrite_dedupe(target: &std::path::Path, link: &std::path::Path) -> io::Result<()> {
     use nix::request_code_readwrite;
     use std::os::unix::prelude::AsRawFd;
     use std::mem::{size_of, zeroed};
@@ -149,7 +205,7 @@ fn reflink_overwrite(target: &std::path::Path, link: &std::path::Path) -> io::Re
     const FIDEDUPERANGE_NR: u8 = 54;
 
     // Status codes from Linux kernel
-    // FILE_DEDUPE_RANGE_SAME: i32 = 0: Blocks are identical and were successfully deduplicated
+    // FILE_DEDUPE_RANGE_SAME = 0: Blocks are identical and were successfully deduplicated
     const FILE_DEDUPE_RANGE_DIFFERS: i32 = 1;
 
     // Define dedupe range structures
