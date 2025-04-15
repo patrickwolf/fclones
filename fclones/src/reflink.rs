@@ -109,14 +109,14 @@ fn linux_reflink(src: &PathAndMetadata, dest: &PathAndMetadata, log: &dyn Log) -
     // Try FIDEDUPERANGE first, fall back to FICLONE if not supported
     let result = reflink_overwrite_dedupe(&fs_target, &std_link);
     let result = match result {
-        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+        // Check for both EOPNOTSUPP (95) and ENOTTY (25) as possible "ioctl not supported" errors
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) || e.raw_os_error() == Some(libc::ENOTTY) => {
             // Fall back to FICLONE
             reflink_overwrite(&fs_target, &std_link)
         }
         other => other,
     };
 
-    // Use the same error handling pattern as the original code
     match result {
         Err(e) => {
             if let Err(remove_err) = FsCommand::unsafe_rename(&tmp, &dest.path) {
@@ -181,12 +181,12 @@ fn reflink_overwrite(target: &std::path::Path, link: &std::path::Path) -> io::Re
     }
 }
 
-/// Reflink `target` to `link` and expect these two files to be equally sized.
+/// New implementation using FIDEDUPERANGE for safer deduplication
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn reflink_overwrite_dedupe(target: &std::path::Path, link: &std::path::Path) -> io::Result<()> {
     use nix::request_code_readwrite;
-    use std::os::unix::prelude::AsRawFd;
     use std::mem::{size_of, zeroed};
+    use std::os::unix::prelude::AsRawFd;
 
     let src = fs::File::open(target)?;
     let src_metadata = src.metadata()?;
@@ -230,39 +230,40 @@ fn reflink_overwrite_dedupe(target: &std::path::Path, link: &std::path::Path) ->
 
     // Calculate the total size of the structure for the ioctl call
     const FIDEDUPERANGE_SIZE: usize = size_of::<FileDedupRange>();
-    
+
     // Process deduplication potentially in chunks
     // Prior to Linux kernel 4.18, btrfs had a 16MiB restriction on FIDEDUPERANGE
     // This loop handles both older kernels (multiple iterations) and newer ones (likely one iteration)
     let mut offset: u64 = 0;
-    
+
     while offset < src_size {
         // Prepare dedupe range struct
         let mut dedupe_range: FileDedupRange = unsafe { zeroed() };
-        
+
         // Set source information
         dedupe_range.src_offset = offset;
         dedupe_range.src_length = src_size - offset;
         dedupe_range.dest_count = 1;
         dedupe_range.reserved1 = 0;
         dedupe_range.reserved2 = 0;
-        
+
         // Set destination information
         dedupe_range.info[0].dest_fd = dest.as_raw_fd() as i64;
         dedupe_range.info[0].dest_offset = offset;
         dedupe_range.info[0].bytes_deduped = 0;
         dedupe_range.info[0].status = 0;
         dedupe_range.info[0].reserved = 0;
-        
+
         // Call FIDEDUPERANGE ioctl
         let ret = unsafe {
             libc::ioctl(
                 src.as_raw_fd(),
-                request_code_readwrite!(FIDEDUPERANGE_TYPE, FIDEDUPERANGE_NR, FIDEDUPERANGE_SIZE) as libc::c_ulong,
+                request_code_readwrite!(FIDEDUPERANGE_TYPE, FIDEDUPERANGE_NR, FIDEDUPERANGE_SIZE)
+                    as libc::c_ulong,
                 &mut dedupe_range,
             )
         };
-        
+
         #[allow(clippy::if_same_then_else)]
         if ret == -1 {
             let err = io::Error::last_os_error();
@@ -275,7 +276,7 @@ fn reflink_overwrite_dedupe(target: &std::path::Path, link: &std::path::Path) ->
             }
             return Err(err);
         }
-        
+
         // Check for content differences - FIDEDUPERANGE verifies content identity
         if dedupe_range.info[0].status == FILE_DEDUPE_RANGE_DIFFERS {
             return Err(io::Error::new(
@@ -283,7 +284,7 @@ fn reflink_overwrite_dedupe(target: &std::path::Path, link: &std::path::Path) ->
                 "File contents differ, cannot deduplicate",
             ));
         }
-        
+
         // Get bytes deduped - on older btrfs (pre-kernel 4.18), this may be limited to 16MiB
         // On newer kernels, this will typically process the entire file in one go
         let bytes_deduped = dedupe_range.info[0].bytes_deduped;
@@ -291,11 +292,11 @@ fn reflink_overwrite_dedupe(target: &std::path::Path, link: &std::path::Path) ->
             // No bytes deduped but no error, might be end of file
             break;
         }
-        
+
         // Move offset for next chunk
         offset += bytes_deduped;
     }
-    
+
     Ok(())
 }
 
