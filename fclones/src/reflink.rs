@@ -128,10 +128,13 @@ fn linux_reflink(src: &PathAndMetadata, dest: &PathAndMetadata, log: &dyn Log) -
 /// Reflink `target` to `link` and expect these two files to be equally sized.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn reflink_overwrite(target: &std::path::Path, link: &std::path::Path) -> io::Result<()> {
-    use nix::request_code_write;
+    use nix::request_code_read_write;
     use std::os::unix::prelude::AsRawFd;
+    use std::mem::{size_of, zeroed};
 
     let src = fs::File::open(target)?;
+    let src_metadata = src.metadata()?;
+    let src_size = src_metadata.len();
 
     // This operation does not require `.truncate(true)` because the files are already of the same size.
     let dest = fs::OpenOptions::new()
@@ -141,33 +144,103 @@ fn reflink_overwrite(target: &std::path::Path, link: &std::path::Path) -> io::Re
         .open(link)?;
 
     // From /usr/include/linux/fs.h:
-    // #define FICLONE		_IOW(0x94, 9, int)
-    const FICLONE_TYPE: u8 = 0x94;
-    const FICLONE_NR: u8 = 9;
-    const FICLONE_SIZE: usize = std::mem::size_of::<libc::c_int>();
+    // #define FIDEDUPERANGE _IOWR(0x94, 54, struct file_dedupe_range)
+    const FIDEDUPERANGE_TYPE: u8 = 0x94;
+    const FIDEDUPERANGE_NR: u8 = 54;
 
-    let ret = unsafe {
-        libc::ioctl(
-            dest.as_raw_fd(),
-            request_code_write!(FICLONE_TYPE, FICLONE_NR, FICLONE_SIZE),
-            src.as_raw_fd(),
-        )
-    };
+    // Status codes from Linux kernel
+    const FILE_DEDUPE_RANGE_SAME: i32 = 0;
+    const FILE_DEDUPE_RANGE_DIFFERS: i32 = 1;
 
-    #[allow(clippy::if_same_then_else)]
-    if ret == -1 {
-        let err = io::Error::last_os_error();
-        let code = err.raw_os_error().unwrap(); // unwrap () Ok, created from `last_os_error()`
-        if code == libc::EOPNOTSUPP { // 95
-             // Filesystem does not supported reflinks.
-             // No cleanup required, file is left untouched.
-        } else if code == libc::EINVAL { // 22
-             // Source filesize was larger than destination.
-        }
-        Err(err)
-    } else {
-        Ok(())
+    // Define dedupe range structures
+    #[repr(C)]
+    struct FileDedupRangeInfo {
+        dest_fd: i64,
+        dest_offset: u64,
+        bytes_deduped: u64,
+        status: i32,
+        reserved: u32,
     }
+
+    #[repr(C)]
+    struct FileDedupRange {
+        src_offset: u64,
+        src_length: u64,
+        dest_count: u16,
+        reserved1: u16,
+        reserved2: u32,
+        info: [FileDedupRangeInfo; 1],
+    }
+
+    // Calculate the total size of the structure for the ioctl call
+    const FIDEDUPERANGE_SIZE: usize = size_of::<FileDedupRange>();
+    
+    // Process deduplication potentially in chunks
+    // Prior to Linux kernel 4.18, btrfs had a 16MiB restriction on FIDEDUPERANGE
+    // This loop handles both older kernels (multiple iterations) and newer ones (likely one iteration)
+    let mut offset: u64 = 0;
+    
+    while offset < src_size {
+        // Prepare dedupe range struct
+        let mut dedupe_range: FileDedupRange = unsafe { zeroed() };
+        
+        // Set source information
+        dedupe_range.src_offset = offset;
+        dedupe_range.src_length = src_size - offset;
+        dedupe_range.dest_count = 1;
+        dedupe_range.reserved1 = 0;
+        dedupe_range.reserved2 = 0;
+        
+        // Set destination information
+        dedupe_range.info[0].dest_fd = dest.as_raw_fd() as i64;
+        dedupe_range.info[0].dest_offset = offset;
+        dedupe_range.info[0].bytes_deduped = 0;
+        dedupe_range.info[0].status = 0;
+        dedupe_range.info[0].reserved = 0;
+        
+        // Call FIDEDUPERANGE ioctl
+        let ret = unsafe {
+            libc::ioctl(
+                src.as_raw_fd(),
+                request_code_read_write!(FIDEDUPERANGE_TYPE, FIDEDUPERANGE_NR, FIDEDUPERANGE_SIZE) as libc::c_ulong,
+                &mut dedupe_range,
+            )
+        };
+        
+        #[allow(clippy::if_same_then_else)]
+        if ret == -1 {
+            let err = io::Error::last_os_error();
+            let code = err.raw_os_error().unwrap(); // unwrap () Ok, created from `last_os_error()`
+            if code == libc::EOPNOTSUPP { // 95
+                 // Filesystem does not supported reflinks.
+                 // No cleanup required, file is left untouched.
+            } else if code == libc::EINVAL { // 22
+                 // Source filesize was larger than destination.
+            }
+            return Err(err);
+        }
+        
+        // Check for content differences - FIDEDUPERANGE verifies content identity
+        if dedupe_range.info[0].status == FILE_DEDUPE_RANGE_DIFFERS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "File contents differ, cannot deduplicate",
+            ));
+        }
+        
+        // Get bytes deduped - on older btrfs (pre-kernel 4.18), this may be limited to 16MiB
+        // On newer kernels, this will typically process the entire file in one go
+        let bytes_deduped = dedupe_range.info[0].bytes_deduped;
+        if bytes_deduped == 0 {
+            // No bytes deduped but no error, might be end of file
+            break;
+        }
+        
+        // Move offset for next chunk
+        offset += bytes_deduped;
+    }
+    
+    Ok(())
 }
 
 /// Restores file owner and group
