@@ -548,6 +548,31 @@ pub mod test {
         }
     }
 
+    // Helper to check if FIDEDUPERANGE is supported on this system
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn fideduperange_supported() -> bool {
+        if !cached_reflink_supported() {
+            return false;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source_test");
+        let dest_path = dir.path().join("dest_test");
+
+        // Create identical files
+        write_file(&source_path, "test content");
+        write_file(&dest_path, "test content");
+
+        // Try FIDEDUPERANGE
+        let result = reflink_overwrite_dedupe(&source_path, &dest_path);
+
+        match result {
+            Err(e) if e.raw_os_error() == Some(libc::ENOTTY) ||
+                      e.raw_os_error() == Some(libc::EOPNOTSUPP) => false,
+            _ => true
+        }
+    }
+
     // Usually /dev/shm only exists on Linux.
     #[cfg(target_os = "linux")]
     fn test_reflink_command_fails_on_dev_shm_tmpfs() {
@@ -709,9 +734,6 @@ pub mod test {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_reflink_overwrite_with_different_content() {
-        // Remove the CrossTest lock to avoid mutex poisoning
-        // let _sequential = cfg::CrossTest::new(false);
-
         if !cached_reflink_supported() {
             return;
         }
@@ -774,10 +796,9 @@ pub mod test {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_reflink_overwrite_dedupe_rejects_different_content() {
-        // Remove the CrossTest lock to avoid mutex poisoning
-        // let _sequential = cfg::CrossTest::new(false);
-
-        if !cached_reflink_supported() {
+        // Skip if FIDEDUPERANGE is not supported
+        if !fideduperange_supported() {
+            println!("Skipping test: FIDEDUPERANGE not supported on this system");
             return;
         }
 
@@ -843,10 +864,9 @@ pub mod test {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_reflink_overwrite_dedupe_with_identical_content() {
-        // Remove the CrossTest lock to avoid mutex poisoning
-        // let _sequential = cfg::CrossTest::new(false);
-
-        if !cached_reflink_supported() {
+        // Skip if FIDEDUPERANGE is not supported
+        if !fideduperange_supported() {
+            println!("Skipping test: FIDEDUPERANGE not supported on this system");
             return;
         }
 
@@ -906,10 +926,9 @@ pub mod test {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_reflink_overwrite_dedupe_large_file_chunking() {
-        // Remove the CrossTest lock to avoid mutex poisoning
-        // let _sequential = cfg::CrossTest::new(false);
-
-        if !cached_reflink_supported() {
+        // Skip if FIDEDUPERANGE is not supported
+        if !fideduperange_supported() {
+            println!("Skipping test: FIDEDUPERANGE not supported on this system");
             return;
         }
 
@@ -963,10 +982,9 @@ pub mod test {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_reflink_overwrite_dedupe_large_file_one_byte_different() {
-        // Remove the CrossTest lock to avoid mutex poisoning
-        // let _sequential = cfg::CrossTest::new(false);
-
-        if !cached_reflink_supported() {
+        // Skip if FIDEDUPERANGE is not supported
+        if !fideduperange_supported() {
+            println!("Skipping test: FIDEDUPERANGE not supported on this system");
             return;
         }
 
@@ -1030,9 +1048,6 @@ pub mod test {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn test_linux_reflink_fallback_behavior() {
-        // Remove the CrossTest lock to avoid mutex poisoning
-        // let _sequential = cfg::CrossTest::new(false);
-
         if !cached_reflink_supported() {
             return;
         }
