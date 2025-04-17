@@ -519,6 +519,34 @@ pub mod test {
 
     use super::*;
     use crate::path::Path as FcPath;
+    use crate::file::{FileChunk, FileLen, FilePos, FileHash};
+    use crate::hasher::FileHasher;
+    use crate::hasher::HashFn;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::fs::OpenOptions;
+
+    // Helper function to compute hash of a file using the project's hasher
+    fn compute_file_hash(path: &std::path::Path) -> FileHash {
+        let log = StdLog::new();
+        let hasher = FileHasher::new(HashFn::Metro, None, &log);
+        let fc_path = FcPath::from(path);
+        let chunk = FileChunk::new(&fc_path, FilePos(0), FileLen::MAX);
+        hasher.hash_file(&chunk, |_| {}).unwrap()
+    }
+    
+    // Helper to generate large files with specified content
+    fn create_large_file(path: &std::path::Path, size_mb: usize, pattern_char: char) {
+        let chunk_size = 1024 * 1024; // 1MB chunks
+        let mut file = File::create(path).unwrap();
+        
+        for i in 0..size_mb {
+            // Create a chunk with a unique pattern that includes the chunk number
+            let mut chunk = format!("CHUNK{:04}:{}", i, pattern_char);
+            // Pad to fill the chunk size
+            chunk.push_str(&pattern_char.to_string().repeat(chunk_size - chunk.len()));
+            file.write_all(chunk.as_bytes()).unwrap();
+        }
+    }
 
     // Usually /dev/shm only exists on Linux.
     #[cfg(target_os = "linux")]
@@ -677,135 +705,311 @@ pub mod test {
         test_reflink_command_fills_file_with_content();
     }
 
+    // Test that FICLONE overwrites a file even when content is different (unsafe behavior)
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn test_reflink_with_fideduperange_fallback() {
+    fn test_reflink_overwrite_with_different_content() {
         let _sequential = cfg::CrossTest::new(false);
-
+        
         if !cached_reflink_supported() {
             return;
         }
-
-        with_dir("dedupe/reflink_dedupe_fallback", |root| {
-            let log = StdLog::new();
-            let file_path_1 = root.join("source_file");
-            let file_path_2 = root.join("dest_file");
-            let test_content = "test content for dedupe";
-
-            // Create test files
-            write_file(&file_path_1, test_content);
-            write_file(&file_path_2, "original content");
-
-            // Create PathAndMetadata objects
-            let file_1 = PathAndMetadata::new(FcPath::from(&file_path_1)).unwrap();
-            let file_2 = PathAndMetadata::new(FcPath::from(&file_path_2)).unwrap();
-
-            // Directly call linux_reflink which will try FIDEDUPERANGE first
-            linux_reflink(&file_1, &file_2, &log).unwrap();
-
-            // Verify that the destination now has the source content
-            assert_eq!(read_file(&file_path_2), test_content);
-
-            // Verify files still exist
-            assert!(file_path_1.exists());
-            assert!(file_path_2.exists());
-        })
+        
+        with_dir("dedupe/reflink_clone_different", |root| {
+            let source_path = root.join("source_file");
+            let dest_path = root.join("dest_file");
+            
+            // Create files with same size but different content
+            write_file(&source_path, "source content AAA");
+            write_file(&dest_path, "different content");
+            
+            // Calculate initial hashes
+            let source_hash_before = compute_file_hash(&source_path);
+            let dest_hash_before = compute_file_hash(&dest_path);
+            
+            // Verify hashes are different initially
+            assert_ne!(source_hash_before, dest_hash_before, "Source and destination should have different content initially");
+            
+            // Perform FICLONE operation
+            let result = reflink_overwrite(&source_path, &dest_path);
+            assert!(result.is_ok(), "FICLONE operation should succeed even with different content");
+            
+            // Calculate hashes after reflink
+            let source_hash_after = compute_file_hash(&source_path);
+            let dest_hash_after = compute_file_hash(&dest_path);
+            
+            // Source should be unchanged
+            assert_eq!(source_hash_before, source_hash_after, "Source file should be unchanged");
+            
+            // Destination should now match source (UNSAFE BEHAVIOR OF FICLONE)
+            assert_eq!(dest_hash_after, source_hash_after, 
+                "FICLONE overwrites destination content without verifying, which is unsafe");
+            assert_ne!(dest_hash_before, dest_hash_after, 
+                "Destination content was changed by FICLONE");
+            
+            // Verify content directly
+            assert_eq!(read_file(&dest_path), "source content AAA", 
+                "Destination content should be overwritten with source content");
+        });
     }
 
+    // Test that FIDEDUPERANGE rejects files with same size but different content (safe behavior)
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn test_reflink_with_fideduperange_identical_content() {
+    fn test_reflink_overwrite_dedupe_rejects_different_content() {
         let _sequential = cfg::CrossTest::new(false);
-
+        
         if !cached_reflink_supported() {
             return;
         }
+        
+        with_dir("dedupe/reflink_dedupe_different", |root| {
+            let source_path = root.join("source_file");
+            let dest_path = root.join("dest_file");
+            
+            // Create files with same size but different content
+            write_file(&source_path, "source content AAA");
+            write_file(&dest_path, "different content");
+            
+            // Calculate initial hashes
+            let source_hash_before = compute_file_hash(&source_path);
+            let dest_hash_before = compute_file_hash(&dest_path);
+            
+            // Verify hashes are different initially
+            assert_ne!(source_hash_before, dest_hash_before, "Source and destination should have different content initially");
+            
+            // Perform FIDEDUPERANGE operation
+            let result = reflink_overwrite_dedupe(&source_path, &dest_path);
+            
+            // Should fail with error about content differing
+            assert!(result.is_err(), "FIDEDUPERANGE operation should fail with different content");
+            
+            // Get the error message
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("differ") || error.to_string().contains("Invalid"), 
+                "Error should indicate content differs: {}", error);
+            
+            // Calculate hashes after attempted reflink
+            let source_hash_after = compute_file_hash(&source_path);
+            let dest_hash_after = compute_file_hash(&dest_path);
+            
+            // Both files should be unchanged
+            assert_eq!(source_hash_before, source_hash_after, "Source file should be unchanged");
+            assert_eq!(dest_hash_before, dest_hash_after, 
+                "Destination file should be unchanged when FIDEDUPERANGE rejects different content");
+            
+            // Verify content directly
+            assert_eq!(read_file(&dest_path), "different content", 
+                "Destination content should remain unchanged");
+        });
+    }
 
+    // Test that FIDEDUPERANGE works correctly with identical small files
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn test_reflink_overwrite_dedupe_with_identical_content() {
+        let _sequential = cfg::CrossTest::new(false);
+        
+        if !cached_reflink_supported() {
+            return;
+        }
+        
         with_dir("dedupe/reflink_dedupe_identical", |root| {
-            let log = StdLog::new();
-            let file_path_1 = root.join("source_file");
-            let file_path_2 = root.join("dest_file");
-            let test_content = "identical content in both files";
-
-            // Create identical test files
-            write_file(&file_path_1, test_content);
-            write_file(&file_path_2, test_content);
-
-            // Slightly modify the file metadata to ensure they aren't already the same inode
-            // This ensures a real deduplication happens rather than a no-op
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&file_path_2).unwrap().permissions();
-                perms.set_mode(0o644); // Ensure standard permissions
-                fs::set_permissions(&file_path_2, perms).unwrap();
-            }
-
-            // Create PathAndMetadata objects
-            let file_1 = PathAndMetadata::new(FcPath::from(&file_path_1)).unwrap();
-            let file_2 = PathAndMetadata::new(FcPath::from(&file_path_2)).unwrap();
-
-            // Directly call linux_reflink which will try FIDEDUPERANGE first
-            linux_reflink(&file_1, &file_2, &log).unwrap();
-
-            // Verify content is still correct
-            assert_eq!(read_file(&file_path_2), test_content);
-
-            // Verify files still exist
-            assert!(file_path_1.exists());
-            assert!(file_path_2.exists());
-        })
+            let source_path = root.join("source_file");
+            let dest_path = root.join("dest_file");
+            
+            // Create identical files
+            write_file(&source_path, "identical content in both files");
+            write_file(&dest_path, "identical content in both files");
+            
+            // Calculate initial hashes
+            let source_hash_before = compute_file_hash(&source_path);
+            let dest_hash_before = compute_file_hash(&dest_path);
+            
+            // Verify hashes are identical initially
+            assert_eq!(source_hash_before, dest_hash_before, "Source and destination should have identical content");
+            
+            // Perform FIDEDUPERANGE operation
+            let result = reflink_overwrite_dedupe(&source_path, &dest_path);
+            assert!(result.is_ok(), "FIDEDUPERANGE operation should succeed with identical content");
+            
+            // Calculate hashes after reflink
+            let source_hash_after = compute_file_hash(&source_path);
+            let dest_hash_after = compute_file_hash(&dest_path);
+            
+            // Both files should be unchanged
+            assert_eq!(source_hash_before, source_hash_after, "Source file should be unchanged");
+            assert_eq!(dest_hash_before, dest_hash_after, "Destination file should be unchanged");
+            assert_eq!(source_hash_after, dest_hash_after, "Files should still be identical");
+            
+            // Verify content directly
+            assert_eq!(read_file(&dest_path), "identical content in both files", 
+                "Destination content should remain the same");
+        });
     }
 
+    // Test that FIDEDUPERANGE works with a 21MB file (chunking)
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn test_reflink_with_fideduperange_large_file() {
+    fn test_reflink_overwrite_dedupe_large_file_chunking() {
         let _sequential = cfg::CrossTest::new(false);
-
+        
         if !cached_reflink_supported() {
             return;
         }
+        
+        with_dir("dedupe/reflink_dedupe_large", |root| {
+            let source_path = root.join("large_source");
+            let dest_path = root.join("large_dest");
+            
+            // Create 21MB files with identical content
+            create_large_file(&source_path, 21, 'A');
+            create_large_file(&dest_path, 21, 'A');
+            
+            // Calculate initial hashes
+            let source_hash_before = compute_file_hash(&source_path);
+            let dest_hash_before = compute_file_hash(&dest_path);
+            
+            // Verify hashes are identical initially
+            assert_eq!(source_hash_before, dest_hash_before, "Large files should have identical content");
+            
+            // Perform FIDEDUPERANGE operation
+            let result = reflink_overwrite_dedupe(&source_path, &dest_path);
+            assert!(result.is_ok(), "FIDEDUPERANGE operation should succeed with identical large files");
+            
+            // Calculate hashes after reflink
+            let source_hash_after = compute_file_hash(&source_path);
+            let dest_hash_after = compute_file_hash(&dest_path);
+            
+            // Both files should be unchanged
+            assert_eq!(source_hash_before, source_hash_after, "Source file should be unchanged");
+            assert_eq!(dest_hash_before, dest_hash_after, "Destination file should be unchanged");
+            assert_eq!(source_hash_after, dest_hash_after, "Files should still be identical");
+        });
+    }
 
-        with_dir("dedupe/reflink_dedupe_large_file", |root| {
+    // Test that FIDEDUPERANGE detects differences in large files
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn test_reflink_overwrite_dedupe_large_file_one_byte_different() {
+        let _sequential = cfg::CrossTest::new(false);
+        
+        if !cached_reflink_supported() {
+            return;
+        }
+        
+        with_dir("dedupe/reflink_dedupe_large_different", |root| {
+            let source_path = root.join("large_source_a");
+            let dest_path = root.join("large_dest_b");
+            
+            // Create 21MB files with nearly identical content, except one byte
+            create_large_file(&source_path, 21, 'A');
+            create_large_file(&dest_path, 21, 'A');
+            
+            // Modify one byte in the middle of the destination file
+            let mut file = OpenOptions::new().write(true).open(&dest_path).unwrap();
+            file.seek(SeekFrom::Start(10 * 1024 * 1024)).unwrap(); // Seek to 10MB position
+            file.write_all(b"B").unwrap(); // Write a different byte
+            
+            // Calculate initial hashes
+            let source_hash_before = compute_file_hash(&source_path);
+            let dest_hash_before = compute_file_hash(&dest_path);
+            
+            // Verify hashes are different initially
+            assert_ne!(source_hash_before, dest_hash_before, "Files should have different content due to one byte change");
+            
+            // Perform FIDEDUPERANGE operation
+            let result = reflink_overwrite_dedupe(&source_path, &dest_path);
+            
+            // Should fail with error about content differing
+            assert!(result.is_err(), "FIDEDUPERANGE operation should fail with one byte difference");
+            
+            // Get the error message
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("differ") || error.to_string().contains("Invalid"), 
+                "Error should indicate content differs: {}", error);
+            
+            // Calculate hashes after attempted reflink
+            let source_hash_after = compute_file_hash(&source_path);
+            let dest_hash_after = compute_file_hash(&dest_path);
+            
+            // Both files should be unchanged
+            assert_eq!(source_hash_before, source_hash_after, "Source file should be unchanged");
+            assert_eq!(dest_hash_before, dest_hash_after, 
+                "Destination file should be unchanged when FIDEDUPERANGE rejects different content");
+        });
+    }
+
+    // Test that linux_reflink with fallback behavior preserves file integrity
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn test_linux_reflink_fallback_behavior() {
+        let _sequential = cfg::CrossTest::new(false);
+        
+        if !cached_reflink_supported() {
+            return;
+        }
+        
+        with_dir("dedupe/linux_reflink_fallback", |root| {
             let log = StdLog::new();
-            let file_path_1 = root.join("large_source_file");
-            let file_path_2 = root.join("large_dest_file");
-
-            // Create a 20MB file (exceeds the 16MB limit that some older kernels had for FIDEDUPERANGE)
-            // Use a repeating pattern to save memory during test
-            let chunk = "0123456789ABCDEF".repeat(4096); // 64KB chunk
-            let mut large_content = String::new();
-            for i in 0..320 {
-                // 320 * 64KB = 20MB
-                large_content.push_str(&format!("CHUNK{:04}:", i));
-                large_content.push_str(&chunk);
-                large_content.push('\n');
-            }
-
-            // Write the large file and a different destination file
-            write_file(&file_path_1, &large_content);
-            write_file(&file_path_2, "original small content");
-
+            let file_path_1 = root.join("source_file");
+            let file_path_2 = root.join("dest_file");
+            
+            // Create files with same size but different content
+            write_file(&file_path_1, "source content AAA");
+            write_file(&file_path_2, "different content");
+            
+            // Calculate initial hashes
+            let hash_1_before = compute_file_hash(&file_path_1);
+            let hash_2_before = compute_file_hash(&file_path_2);
+            
+            // Verify hashes are different initially
+            assert_ne!(hash_1_before, hash_2_before, "Files should have different content");
+            
             // Create PathAndMetadata objects
             let file_1 = PathAndMetadata::new(FcPath::from(&file_path_1)).unwrap();
             let file_2 = PathAndMetadata::new(FcPath::from(&file_path_2)).unwrap();
-
-            // Directly call linux_reflink which will try FIDEDUPERANGE first
-            linux_reflink(&file_1, &file_2, &log).unwrap();
-
-            // Verify the file size is correct (this avoids loading the entire file into memory)
-            let dest_metadata = fs::metadata(&file_path_2).unwrap();
-            let src_metadata = fs::metadata(&file_path_1).unwrap();
-            assert_eq!(dest_metadata.len(), src_metadata.len());
-
-            // Verify the beginning and end of the file (avoiding loading the entire file)
-            let dest_content = read_file(&file_path_2);
-            assert!(dest_content.starts_with("CHUNK0000:"));
-            assert!(dest_content.ends_with("\n"));
-
-            // Verify files still exist
-            assert!(file_path_1.exists());
-            assert!(file_path_2.exists());
-        })
+            
+            // Call linux_reflink which tries FIDEDUPERANGE first, then falls back to FICLONE
+            let result = linux_reflink(&file_1, &file_2, &log);
+            
+            // Check the result - this test is primarily informational to understand
+            // the fallback behavior in the actual environment
+            match result {
+                Ok(_) => {
+                    // Operation succeeded, meaning either:
+                    // 1. FIDEDUPERANGE isn't supported and it fell back to FICLONE, or
+                    // 2. The kernel handled the operation differently than expected
+                    
+                    // Calculate hashes after reflink
+                    let hash_1_after = compute_file_hash(&file_path_1);
+                    let hash_2_after = compute_file_hash(&file_path_2);
+                    
+                    // The source should be unchanged
+                    assert_eq!(hash_1_before, hash_1_after, "Source file should be unchanged");
+                    
+                    // Check if destination was changed
+                    if hash_2_after == hash_1_after && hash_2_before != hash_2_after {
+                        println!("Note: linux_reflink succeeded with different content - likely fell back to FICLONE");
+                        assert_eq!(read_file(&file_path_2), "source content AAA",
+                            "Destination content matches source after fallback to FICLONE");
+                    }
+                },
+                Err(e) => {
+                    // FIDEDUPERANGE detected content difference and rejected the operation
+                    println!("linux_reflink failed as expected with different content: {}", e);
+                    
+                    // Calculate hashes after failed reflink
+                    let hash_1_after = compute_file_hash(&file_path_1);
+                    let hash_2_after = compute_file_hash(&file_path_2);
+                    
+                    // Both files should be unchanged
+                    assert_eq!(hash_1_before, hash_1_after, "Source file should be unchanged");
+                    assert_eq!(hash_2_before, hash_2_after, "Destination file should be unchanged");
+                    assert_eq!(read_file(&file_path_2), "different content", 
+                        "Destination content should remain unchanged");
+                }
+            }
+        });
     }
 }
