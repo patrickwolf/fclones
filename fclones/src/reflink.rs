@@ -567,9 +567,13 @@ pub mod test {
         let result = reflink_overwrite_dedupe(&source_path, &dest_path);
 
         match result {
-            Err(e) if e.raw_os_error() == Some(libc::ENOTTY) ||
-                      e.raw_os_error() == Some(libc::EOPNOTSUPP) => false,
-            _ => true
+            Err(e)
+                if e.raw_os_error() == Some(libc::ENOTTY)
+                    || e.raw_os_error() == Some(libc::EOPNOTSUPP) =>
+            {
+                false
+            }
+            _ => true,
         }
     }
 
